@@ -21,14 +21,53 @@ const ANIMAL_RANGES = {
   }
 };
 
-export const generateLiveStats = (animalType = 'dog') => {
+// Fetch real sensor data from ESP32 bridge
+export const fetchSensorData = async () => {
+  try {
+    const response = await fetch('http://localhost:3000/pet_data.csv');
+    if (!response.ok) throw new Error('Sensor not connected');
+    const text = await response.text();
+    const lines = text.trim().split('\n');
+    
+    if (lines.length < 2) return null;
+    
+    // Parse last data point (most recent)
+    const lastLine = lines[lines.length - 1];
+    const [pulse, accelX, accelY, accelZ] = lastLine.split(',').map(Number);
+    
+    // Calculate motion from accelerometer (magnitude)
+    const motion = Math.sqrt(accelX**2 + accelY**2 + accelZ**2).toFixed(1);
+    
+    return { heartRate: pulse, motion, accelX, accelY, accelZ };
+  } catch (error) {
+    console.log('Using simulated data:', error.message);
+    return null;
+  }
+};
+
+export const generateLiveStats = async (animalType = 'dog') => {
   const ranges = ANIMAL_RANGES[animalType] || ANIMAL_RANGES.dog;
 
-  // Generate values based on specific animal ranges
-  const heartRate = Math.floor(Math.random() * (ranges.hr.max - ranges.hr.min + 1)) + ranges.hr.min;
-  const temp = (ranges.temp.min + Math.random() * (ranges.temp.max - ranges.temp.min)).toFixed(1);
-  const spo2 = Math.floor(Math.random() * (ranges.spo2.max - ranges.spo2.min + 1)) + ranges.spo2.min;
-  const activity = Math.floor(Math.random() * 20) + 60; // 60-80% baseline
+  // Try to get real sensor data first
+  const sensorData = await fetchSensorData();
+  
+  let heartRate, temp, spo2, activity;
+  
+  if (sensorData) {
+    // Use real sensor data from ESP32
+    heartRate = sensorData.heartRate;
+    // Map motion to activity percentage (0-100)
+    activity = Math.min(100, Math.max(0, (sensorData.motion / 20) * 100));
+    // Estimate temp/spo2 (not measured by ESP32)
+    temp = (ranges.temp.min + Math.random() * (ranges.temp.max - ranges.temp.min)).toFixed(1);
+    spo2 = 97 + Math.floor(Math.random() * 3);
+  } else {
+    // Generate simulated values based on specific animal ranges
+    heartRate = Math.floor(Math.random() * (ranges.hr.max - ranges.hr.min + 1)) + ranges.hr.min;
+    temp = (ranges.temp.min + Math.random() * (ranges.temp.max - ranges.temp.min)).toFixed(1);
+    spo2 = Math.floor(Math.random() * (ranges.spo2.max - ranges.spo2.min + 1)) + ranges.spo2.min;
+    activity = Math.floor(Math.random() * 20) + 60; // 60-80% baseline
+  }
 
   // Anomaly Logic
   let anomaly = null;
