@@ -10,7 +10,7 @@ import { ref, onValue } from 'firebase/database';
 
 const Dashboard = () => {
   const [selectedAnimal, setSelectedAnimal] = useState('dog');
-  const [stats, setStats] = useState({ heartRate: 0, temp: 38.5, spo2: 98, activity: "Still" });
+  const [stats, setStats] = useState({ heartRate: 0, temp: 38.5, spo2: 98, activity: "Still", rawPulse: 0 });
   
   const [alert, setAlert] = useState(null);
   const [aiStatus, setAiStatus] = useState(0); 
@@ -23,7 +23,17 @@ const Dashboard = () => {
   const [bpmHistory, setBpmHistory] = useState([]);     
   const [pulseStrength, setPulseStrength] = useState(1); 
   const [displayBpm, setDisplayBpm] = useState(0);     
+  const [notificationPermission, setNotificationPermission] = useState(
+    typeof Notification !== 'undefined' ? Notification.permission : 'default'
+  );
+  const [mobileAlertsEnabled, setMobileAlertsEnabled] = useState(
+    typeof Notification !== 'undefined' && Notification.permission === 'granted'
+  );
   const bpmBufferRef = useRef([]);                      
+  const prevAiStatusRef = useRef(0);
+  const mobileAlertsEnabledRef = useRef(
+    typeof Notification !== 'undefined' && Notification.permission === 'granted'
+  );
 
   // --- Weekly & Daily Trend States ---
   const [dailyBpmData, setDailyBpmData] = useState([]);
@@ -42,11 +52,22 @@ const Dashboard = () => {
   const latestDataRef = useRef(null); // To store latest Firebase data for the 1-min collection
 
   const generateRealAdvice = (data, currentAiStatus) => {
-    // AI OVERRIDE: If Python model says 1, display ML warning
-    if (currentAiStatus === 1) return `AI WARNING: Abnormal vital patterns detected for a ${selectedAnimal}!`;
-    
-    if (data.Movement > 1.5 && data.HeartRate > 120) return "High activity. Monitoring for over-exhaustion.";
-    if (data.Movement < 0.5 && data.HeartRate > 110) return "Elevated resting heart rate. Check for stress.";
+    const rawPulse = data.AnalogPulse || data.AnalogPulseRaw || 0;
+    const reasons = [];
+    if (data.HeartRate > 120) reasons.push('elevated heart rate');
+    if (data.Movement > 1.5) reasons.push('high activity');
+    if (data.Movement < 0.5 && data.HeartRate > 110) reasons.push('elevated resting heart rate');
+    if (data.SpO2 !== undefined && data.SpO2 < 92) reasons.push('low blood oxygen');
+    if (rawPulse && (rawPulse < 450 || rawPulse > 570)) reasons.push('abnormal raw pulse signal');
+
+    const reasonText = reasons.length > 0 ? reasons.join(', ') : 'unexpected vital pattern';
+
+    if (currentAiStatus === 1) {
+      return `AI WARNING: Anomaly detected for a ${selectedAnimal}. Likely cause: ${reasonText}. Please inspect the pet immediately.`;
+    }
+
+    if (data.Movement > 1.5 && data.HeartRate > 120) return 'High activity detected with elevated heart rate. Monitor for over-exertion.';
+    if (data.Movement < 0.5 && data.HeartRate > 110) return 'Elevated resting heart rate detected. Check for stress or discomfort.';
     return `Vitals stable. ${selectedAnimal} is currently resting/normal.`;
   };
 
@@ -100,6 +121,24 @@ const Dashboard = () => {
     });
   };
 
+  const requestNotificationPermission = async () => {
+    if (typeof Notification === 'undefined') return;
+
+    const permission = await Notification.requestPermission();
+    setNotificationPermission(permission);
+    setMobileAlertsEnabled(permission === 'granted');
+    mobileAlertsEnabledRef.current = permission === 'granted';
+  };
+
+  const sendMobileAlert = (title, body) => {
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+    try {
+      new Notification(title, { body });
+    } catch (error) {
+      console.warn('Mobile alert failed:', error);
+    }
+  };
+
   const handleCalibrate = () => {
     setIsCalibrating(true);
     setTimeout(() => setIsCalibrating(false), 2000);
@@ -117,12 +156,26 @@ const Dashboard = () => {
         latestDataRef.current = dbData; // Update ref for the 1-min collection loop
 
         // 1. Process AI Status
-        setAiStatus(dbData.AI_Status || 0);
-        if (dbData.AI_Status === 1) {
+        const currentAiStatus = dbData.AI_Status || 0;
+        setAiStatus(currentAiStatus);
+
+        const alertMessage = generateRealAdvice(dbData, currentAiStatus);
+        setSuggestion(alertMessage);
+
+        if (currentAiStatus === 1) {
           setAlert({ message: "AI Model detected physiological anomaly!" });
         } else {
           setAlert(null);
         }
+
+        const shouldSendMobileAlert = currentAiStatus === 1 && prevAiStatusRef.current !== 1 && mobileAlertsEnabledRef.current;
+        if (shouldSendMobileAlert) {
+          sendMobileAlert(
+            `PetPulse Alert: ${selectedAnimal}`,
+            alertMessage
+          );
+        }
+        prevAiStatusRef.current = currentAiStatus;
 
         // 2. Process Heart Rate (BPM)
         const rawBpm = dbData.HeartRate || 0;
@@ -136,14 +189,20 @@ const Dashboard = () => {
         setStats({
           heartRate: smoothedBpm,
           temp: dbData.Temperature || 38.5, 
-          spo2: 98, // Usually static unless you have full SpO2 calculation 
+          spo2: dbData.SpO2 ? Math.round(dbData.SpO2) : 0, // Usually static unless you have full SpO2 calculation 
           activity: dbData.Movement > 1.0 ? "Active" : "Still"
         });
 
         // 4. Update Heartbeat Animation (Using AnalogPulse from Firebase)
-        const analogPulse = dbData.AnalogPulse || 512;
+        const analogPulse = dbData.AnalogPulse || dbData.AnalogPulseRaw || 512;
         const scale = 1 + ((analogPulse - 512) / 1024) * 2;
         setPulseStrength(scale > 1 ? scale : 1);
+
+        // 4b. Update raw pulse stat
+        setStats(prev => ({
+          ...prev,
+          rawPulse: Math.round(analogPulse)
+        }));
 
         // 5. Update Advice
         setSuggestion(generateRealAdvice(dbData, dbData.AI_Status || 0));
@@ -208,6 +267,16 @@ const Dashboard = () => {
             <Target size={18} /> {isCalibrating ? 'Calibrating...' : 'Reset Baseline'}
           </button>
 
+          <button
+            className="calibrate-btn"
+            onClick={requestNotificationPermission}
+            disabled={notificationPermission === 'granted'}
+            style={{ background: notificationPermission === 'granted' ? '#6b7280' : undefined }}
+          >
+            <Zap size={18} />
+            {notificationPermission === 'granted' ? 'Alerts Enabled' : 'Enable Mobile Alerts'}
+          </button>
+
           <select value={selectedAnimal} onChange={(e) => setSelectedAnimal(e.target.value)} className="animal-select">
             <option value="dog">🐶 Dog</option>
             <option value="cat">🐱 Cat</option>
@@ -223,29 +292,7 @@ const Dashboard = () => {
       </header>
 
       {/* Live Pulse Visualization Card */}
-      <div className="glass-card live-pulse-card" style={{ 
-        marginBottom: '25px', display: 'flex', justifyContent: 'space-around', alignItems: 'center', padding: '30px' 
-      }}>
-        <div className="heart-animation-wrapper" style={{ position: 'relative' }}>
-          <Heart 
-            size={80} 
-            fill={aiStatus === 1 ? "#991b1b" : "#ef4444"} 
-            color={aiStatus === 1 ? "#991b1b" : "#ef4444"} 
-            style={{ 
-              transform: `scale(${pulseStrength})`, 
-              transition: 'transform 0.1s cubic-bezier(0.175, 0.885, 0.32, 1.275)' 
-            }} 
-          />
-        </div>
-        <div style={{ textAlign: 'center' }}>
-          <h2 style={{ fontSize: '4rem', margin: 0, fontWeight: '900' }}>{displayBpm}</h2>
-          <p style={{ color: '#ef4444', fontWeight: 'bold', margin: 0 }}>LIVE BPM</p>
-        </div>
-        <div style={{ maxWidth: '300px' }}>
-          <h3 style={{ margin: 0, fontSize: '1.2rem' }}>Signal Strength</h3>
-          <p style={{ opacity: 0.7, fontSize: '0.9rem' }}>Cloud Sync: <b>{connectionStatus === 'Online' ? 'STRONG' : 'NONE'}</b></p>
-        </div>
-      </div>
+      
 
       {/* AI Health Insight Section */}
       <div className="glass-card" style={{ 
@@ -321,6 +368,7 @@ const Dashboard = () => {
         <StatCard title="Heart Rate" value={stats.heartRate} unit="BPM" icon={Heart} color="rgba(239, 68, 68, 0.2)" />
         <StatCard title="Activity" value={stats.activity} unit="" icon={Activity} color="rgba(16, 185, 129, 0.2)" />
         <StatCard title="Temperature" value={stats.temp} unit="°C" icon={Thermometer} color="rgba(59, 130, 246, 0.2)" />
+        <StatCard title="Raw Pulse" value={stats.rawPulse} unit="" icon={Zap} color="rgba(245, 158, 11, 0.2)" />
         <StatCard title="Blood Oxygen" value={stats.spo2} unit="%" icon={Droplets} color="rgba(56, 189, 248, 0.2)" />
       </div>
 
@@ -334,66 +382,6 @@ const Dashboard = () => {
         />
       </div>
 
-      {/* Weekly & Daily Trends Section */}
-      <div className="glass-card" style={{ marginTop: '25px', padding: '25px', borderRadius: '15px' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-          <div>
-            <h3 style={{ margin: 0, fontSize: '1.5rem' }}>📈 BPM Trends</h3>
-            <p style={{ margin: '5px 0 0 0', opacity: 0.7 }}>Historical heart rate data</p>
-          </div>
-          <div style={{ display: 'flex', gap: '10px' }}>
-            <button 
-              onClick={() => setTrendTimeRange('daily')}
-              style={{ padding: '10px 20px', background: trendTimeRange === 'daily' ? '#ef4444' : 'rgba(255,255,255,0.1)', border: 'none', borderRadius: '8px', color: 'white', fontWeight: 'bold', cursor: 'pointer' }}
-            >
-              Daily
-            </button>
-            <button 
-              onClick={() => setTrendTimeRange('weekly')}
-              style={{ padding: '10px 20px', background: trendTimeRange === 'weekly' ? '#ef4444' : 'rgba(255,255,255,0.1)', border: 'none', borderRadius: '8px', color: 'white', fontWeight: 'bold', cursor: 'pointer' }}
-            >
-              Weekly
-            </button>
-          </div>
-        </div>
-
-        {/* Trend Stats */}
-        <div style={{ display: 'flex', justifyContent: 'space-around', marginBottom: '20px' }}>
-          <div style={{ textAlign: 'center' }}>
-            <p style={{ margin: 0, opacity: 0.7, fontSize: '0.9rem' }}>AVG BPM</p>
-            <h2 style={{ margin: '5px 0 0 0', fontSize: '2rem', fontWeight: '900' }}>
-              {trendTimeRange === 'daily' ? Math.round(dailyBpmData.reduce((a, b) => a + b.bpm, 0) / (dailyBpmData.length || 1)) : Math.round(weeklyBpmData.reduce((a, b) => a + b.bpm, 0) / (weeklyBpmData.length || 1))}
-            </h2>
-          </div>
-          <div style={{ textAlign: 'center' }}>
-            <p style={{ margin: 0, opacity: 0.7, fontSize: '0.9rem' }}>MAX BPM</p>
-            <h2 style={{ margin: '5px 0 0 0', fontSize: '2rem', fontWeight: '900', color: '#ef4444' }}>
-              {trendTimeRange === 'daily' ? Math.max(...dailyBpmData.map(d => d.bpm), 0) : Math.max(...weeklyBpmData.map(d => d.bpm), 0)}
-            </h2>
-          </div>
-          <div style={{ textAlign: 'center' }}>
-            <p style={{ margin: 0, opacity: 0.7, fontSize: '0.9rem' }}>MIN BPM</p>
-            <h2 style={{ margin: '5px 0 0 0', fontSize: '2rem', fontWeight: '900', color: '#10b981' }}>
-              {trendTimeRange === 'daily' ? Math.min(...dailyBpmData.filter(d => d.bpm > 0).map(d => d.bpm), 0) : Math.min(...weeklyBpmData.filter(d => d.bpm > 0).map(d => d.bpm), 0)}
-            </h2>
-          </div>
-          <div style={{ textAlign: 'center' }}>
-            <p style={{ margin: 0, opacity: 0.7, fontSize: '0.9rem' }}>READINGS</p>
-            <h2 style={{ margin: '5px 0 0 0', fontSize: '2rem', fontWeight: 'bold' }}>
-              {trendTimeRange === 'daily' ? dailyBpmData.length : weeklyBpmData.length}
-            </h2>
-          </div>
-        </div>
-
-        {/* Trend Chart */}
-        <ChartSection 
-          title={trendTimeRange === 'daily' ? "Daily Trend (Last 24 Hours)" : "Weekly Trend (Last 7 Days)"}
-          subtitle={trendTimeRange === 'daily' ? "Hourly average BPM" : "Daily average BPM"}
-          data={trendTimeRange === 'daily' ? dailyBpmData : weeklyBpmData}
-          dataKey="bpm"
-          color="#ef4444"
-        />
-      </div>
 
       <div style={{ marginTop: '25px' }}>
         <AppointmentCard />
